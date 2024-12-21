@@ -11,6 +11,7 @@ MainWindow::MainWindow(QWidget *parent)
     m_client->moveToThread(&m_worker);
     connect(&m_worker, &QThread::finished, m_client, &QObject::deleteLater);
     connect(this, &MainWindow::startClient, m_client, &ClientWorker::onStartClient, Qt::BlockingQueuedConnection);
+    connect(this, &MainWindow::stopClient, m_client, &ClientWorker::onStopClient, Qt::BlockingQueuedConnection);
     m_worker.start();
 }
 
@@ -31,4 +32,13 @@ void MainWindow::on_pushButton_clicked()
 
     }
 
+}
+
+void MainWindow::on_pushButton_2_clicked()
+{
+    if (m_client) {
+        emit stopClient();
+    } else {
+
+    }
 }

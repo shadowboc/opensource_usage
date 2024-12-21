@@ -17,8 +17,11 @@ public:
 
 signals:
     void startClient();
+    void stopClient();
 private slots:
     void on_pushButton_clicked();
+
+    void on_pushButton_2_clicked();
 
 private:
     Ui::MainWindow *ui;

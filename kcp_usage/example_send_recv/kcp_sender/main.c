@@ -19,7 +19,7 @@
 #define SERVER_IP "192.168.0.111"
 #define CLIENT_IP "192.168.0.110"
 #define SERVER_PORT 12345
-#define CLIENT_PORT 12346
+// #define CLIENT_PORT 12346
 #define KCP_SESSION 0x1
 #define KCP_SEND_WND_SIZE 128
 #define KCP_RECV_WND_SIZE 128
@@ -34,8 +34,28 @@
 #define PL_INVALID_SOCKET -1
 #endif
 
+typedef struct
+{
+    char cmd;
+    char opt;
+    char reserve[2];
+    uint32_t dataLen;
+} pre_kcp_header;
+typedef struct
+{
+    pre_kcp_header header;
+    char data[0x10000];
+} pre_kcp_pkt;
+
+typedef enum
+{
+    CMD_TYPE_CTRL_CONN_REQ = 1,
+    CMD_TYPE_CTRL_CLOSE_REQ,
+    CMD_TYPE_KCP
+} cmd_type_e;
+
 SOCKET_PL gUdpSocket;
-struct sockaddr_in gServerAddr;
+struct sockaddr_in gClientAddr;
 int gKcpUser = 5;
 pthread_t gRecvThread;
 pthread_t gUpThread;
@@ -63,9 +83,9 @@ SOCKET_PL *get_udp_socket()
     return &gUdpSocket;
 }
 
-struct sockaddr_in *get_server_addr()
+struct sockaddr_in *get_client_addr()
 {
-    return &gServerAddr;
+    return &gClientAddr;
 }
 
 static inline void itimeofday(long *sec, long *usec)
@@ -115,10 +135,29 @@ static inline IUINT32 iclock()
     return (IUINT32)(iclock64() & 0xfffffffful);
 }
 
+int do_udp_send(const char *buf, int len, cmd_type_e type)
+{
+    pre_kcp_pkt pkt;
+    pkt.header.cmd = (char)type;
+    pkt.header.opt = 0;
+    pkt.header.dataLen = len;
+    if (buf)
+    {
+        memcpy(pkt.data, buf, len);
+    }
+    // const QHostAddress address(QString(SEND_IP));
+    // socket->writeDatagram((const char *)&pkt, len + sizeof(pre_kcp_header), address, SEND_PORT);
+    SOCKET_PL *udp_socket = get_udp_socket();
+    int ret = sendto(*udp_socket, &pkt, len + sizeof(pre_kcp_header), 0, (struct sockaddr *)get_client_addr(), sizeof(struct sockaddr_in));
+    static int ix = 0;
+    printf("real_udp_send....num=%d\n", ++ix);
+    return ret;
+}
 int udp_send(const char *buf, int len, struct IKCPCB *kcp, void *user)
 {
-    SOCKET_PL *udp_socket = get_udp_socket();
-    int ret = sendto(*udp_socket, buf, len, 0, (struct sockaddr *)get_server_addr(), sizeof(struct sockaddr));
+    // SOCKET_PL *udp_socket = get_udp_socket();
+    // int ret = sendto(*udp_socket, buf, len, 0, (struct sockaddr *)get_client_addr(), sizeof(struct sockaddr));
+    int ret = do_udp_send(buf, len, CMD_TYPE_KCP);
     return (ret < 0) ? -1 : 0;
 }
 
@@ -169,23 +208,44 @@ IUINT32 get_tick_count()
 
 void *update_thread(void *arg)
 {
-    ikcpcb *kcp = get_kcp();
     while (1)
     {
-        if (kcp)
+
+        pthread_mutex_lock(&lock);
+        if (get_kcp())
         {
-            pthread_mutex_lock(&lock);
-            ikcp_update(kcp, get_tick_count());
-            pthread_mutex_unlock(&lock);
+            ikcp_update(get_kcp(), get_tick_count());
         }
+        pthread_mutex_unlock(&lock);
         do_sleep(10);
     }
+}
+
+bool kcp_conn()
+{
+    ikcpcb *kcp = ikcp_create(KCP_SESSION, (void *)get_kcp_user());
+    set_kcp(kcp);
+
+    kcp->output = udp_send;
+
+    // kcp参数
+    ikcp_nodelay(kcp, 1, 20, 2, 1); // fast mode, disable congestion control
+    ikcp_wndsize(kcp, KCP_SEND_WND_SIZE, KCP_RECV_WND_SIZE);
+    return true;
+}
+bool kcp_disconn()
+{
+    if (get_kcp())
+    {
+        ikcp_release(get_kcp());
+        set_kcp(NULL);
+    }
+    return true;
 }
 
 void *receiver_thread(void *arg)
 {
     int sockfd = *get_udp_socket();
-    ikcpcb *kcp = get_kcp();
 
     char buf[2048];
     struct sockaddr_in sender_addr;
@@ -193,12 +253,12 @@ void *receiver_thread(void *arg)
     uint32_t ix = 0;
     while (1)
     {
-        if (!kcp)
-        {
-            printf("receiver_thread null....\n");
-            do_sleep(20);
-            continue;
-        }
+        // if (!kcp)
+        // {
+        //     // printf("receiver_thread null....\n");
+        //     do_sleep(20);
+        //     continue;
+        // }
         // ikcp_update(kcp, get_tick_count());
         // printf("receiver_thread....\n");
         // 接收 UDP 数据
@@ -206,9 +266,40 @@ void *receiver_thread(void *arg)
         if (n > 0)
         {
             // 将接收到的数据传递给 KCP
-            pthread_mutex_lock(&lock);
-            ikcp_input(kcp, buf, n);
-            pthread_mutex_unlock(&lock);
+
+            pre_kcp_header *hdr = (pre_kcp_header *)buf;
+            if (CMD_TYPE_KCP == hdr->cmd)
+            {
+                pthread_mutex_lock(&lock);
+                if (n - sizeof(pre_kcp_header))
+                {
+                    if (get_kcp())
+                    {
+                        ikcp_input(get_kcp(), buf + sizeof(pre_kcp_header), n - sizeof(pre_kcp_header));
+                    }
+                }
+                else
+                {
+                    printf("n - sizeof(pre_kcp_header) < 0\n");
+                }
+
+                pthread_mutex_unlock(&lock);
+            }
+            if (CMD_TYPE_CTRL_CONN_REQ == hdr->cmd)
+            {
+                pthread_mutex_lock(&lock);
+                struct sockaddr_in *client_addr = get_client_addr();
+                memcpy(client_addr, &sender_addr, addr_len);
+                kcp_conn();
+                pthread_mutex_unlock(&lock);
+            }
+            if (CMD_TYPE_CTRL_CLOSE_REQ == hdr->cmd)
+            {
+                pthread_mutex_lock(&lock);
+                kcp_disconn();
+                pthread_mutex_unlock(&lock);
+            }
+
             printf("ikcp_input done, num=%d\n", ++ix);
         }
         // 短暂休眠，避免占用过多 CPU
@@ -237,31 +328,31 @@ int main(int argc, char **argv)
     }
 
     // socket bind send port
-    struct sockaddr_in client_addr = {0};
-    client_addr.sin_family = AF_INET;
-    client_addr.sin_port = htons(CLIENT_PORT);
-    client_addr.sin_addr.s_addr = inet_addr(CLIENT_IP);
-    if (bind(*udp_socket, (struct sockaddr *)&client_addr, sizeof(client_addr)) == PL_SOCKET_ERROR)
+    struct sockaddr_in server_addr = {0};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(SERVER_PORT);
+    server_addr.sin_addr.s_addr = inet_addr(CLIENT_IP);
+    if (bind(*udp_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) == PL_SOCKET_ERROR)
     {
         perror("udp socket bind fail");
         exit(EXIT_FAILURE);
     }
 
     // config target addr
-    struct sockaddr_in *server_addr = get_server_addr();
-    server_addr->sin_family = AF_INET;
-    server_addr->sin_port = htons(SERVER_PORT);
-    server_addr->sin_addr.s_addr = inet_addr(SERVER_IP);
+    // struct sockaddr_in *server_addr = get_server_addr();
+    // server_addr->sin_family = AF_INET;
+    // server_addr->sin_port = htons(SERVER_PORT);
+    // server_addr->sin_addr.s_addr = inet_addr(SERVER_IP);
 
     // ikcp control block
-    ikcpcb *kcp = ikcp_create(KCP_SESSION, (void *)get_kcp_user());
-    set_kcp(kcp);
+    // ikcpcb *kcp = ikcp_create(KCP_SESSION, (void *)get_kcp_user());
+    // set_kcp(kcp);
 
-    kcp->output = udp_send;
+    // kcp->output = udp_send;
 
-    // kcp参数
-    ikcp_nodelay(kcp, 1, 20, 2, 1); // fast mode, disable congestion control
-    ikcp_wndsize(kcp, KCP_SEND_WND_SIZE, KCP_RECV_WND_SIZE);
+    // // kcp参数
+    // ikcp_nodelay(kcp, 1, 20, 2, 1); // fast mode, disable congestion control
+    // ikcp_wndsize(kcp, KCP_SEND_WND_SIZE, KCP_RECV_WND_SIZE);
     // ikcp_setmtu(kcp, 1400);
 
     if (pthread_create(get_update_thread(), NULL, update_thread, NULL) != 0)
@@ -281,14 +372,18 @@ int main(int argc, char **argv)
     uint32_t ix = 0;
     while (true)
     {
-        ((uint32_t *)data_buf)[0] = 0xFEFEFEFE;
-        ((uint32_t *)data_buf)[1] = ix++;
-        printf("udp_sending....num=%d\n", ix);
         pthread_mutex_lock(&lock);
-        int send_len = ikcp_send(kcp, data_buf, 60000);
+        if (get_kcp())
+        {
+            ((uint32_t *)data_buf)[0] = 0xFEFEFEFE;
+            ((uint32_t *)data_buf)[1] = ix++;
+            printf("udp_sending....num=%d\n", ix);
+            int send_len = ikcp_send(get_kcp(), data_buf, 1000);
+        }
+
         pthread_mutex_unlock(&lock);
         // ikcp_update(kcp, get_tick_count());
-        do_sleep(10);
+        do_sleep(500);
     }
 
     while (true)
